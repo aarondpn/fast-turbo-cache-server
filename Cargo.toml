@@ -31,7 +31,7 @@ anyhow = "1.0"
 async-trait = "0.1"
 # `http2`: cleartext HTTP/2 (h2c) next to HTTP/1 in `axum::serve`.
 axum = { version = "0.8", features = ["http2"] }
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1.7"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5", features = ["derive", "env"] }
