@@ -1,0 +1,58 @@
+// Cargo dependencies, the Rust toolchain, GitHub Actions, the Dockerfile base images, the
+// docker-compose.yml images and the images pinned in the CI workflow, checked weekly.
+{
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  extends: [
+    'config:recommended',
+    // `uses:` stays pinned to the full commit SHA with the version as a trailing comment.
+    'helpers:pinGitHubActionDigests',
+    // Dockerfile and compose images stay pinned by digest.
+    'docker:pinDigests',
+  ],
+  timezone: 'Europe/Berlin',
+  schedule: ['before 6am on monday'],
+  prConcurrentLimit: 10,
+  // New releases wait 7 days before a PR is opened: compromised releases are usually found and
+  // yanked within days. Security updates are not delayed.
+  minimumReleaseAge: '7 days',
+  internalChecksFilter: 'strict',
+  // Security updates from the OSV database (independent of GitHub's Dependabot alerts).
+  osvVulnerabilityAlerts: true,
+  customManagers: [
+    // Images pinned by digest in the CI workflow (BuildKit, SBOM scanner, emulators).
+    {
+      customType: 'regex',
+      managerFilePatterns: ['/^\\.github/workflows/ci\\.yml$/'],
+      matchStrings: [
+        '(?<depName>[a-z0-9.-]+(?:/[a-z0-9._-]+)+):(?<currentValue>[A-Za-z0-9._-]+)@(?<currentDigest>sha256:[a-f0-9]{64})',
+      ],
+      datasourceTemplate: 'docker',
+    },
+  ],
+  packageRules: [
+    // Non-breaking Cargo updates in one PR: minor and patch from 1.0, only patch below (a 0.x
+    // minor bump is breaking).
+    {
+      matchManagers: ['cargo'],
+      matchUpdateTypes: ['minor', 'patch'],
+      matchCurrentVersion: '!/^0\\./',
+      groupName: 'cargo non-breaking',
+    },
+    {
+      matchManagers: ['cargo'],
+      matchUpdateTypes: ['patch'],
+      matchCurrentVersion: '/^0\\./',
+      groupName: 'cargo non-breaking',
+    },
+    {
+      matchManagers: ['github-actions'],
+      groupName: 'GitHub Actions',
+    },
+    // rust-toolchain.toml and the Dockerfile's `rust` base image move together.
+    {
+      matchManagers: ['rust-toolchain', 'dockerfile'],
+      matchDepNames: ['rust'],
+      groupName: 'Rust',
+    },
+  ],
+}

@@ -1,0 +1,32 @@
+# Build outputs and VCS metadata
+/target
+/target-*
+/.git
+/.gitignore
+/.github
+
+# Local data, secrets and editor files (never bake them into an image)
+/.turbo-cache
+/.claude
+/secrets
+.env
+.env.*
+.DS_Store
+*.swp
+*.swo
+
+# Files that do not affect the build. The builder runs `COPY . .` before compiling, so any file
+# left in the context invalidates the final compile layer when it changes. Excluding docs, licenses
+# and ops files means editing them does not trigger a rebuild. (Cargo.toml's `readme` field is
+# only read by `cargo package`/`publish`, not by `cargo build`.)
+/Dockerfile
+/.dockerignore
+/docker-compose.yml
+/compose
+/deny.toml
+# The base image's Rust is the toolchain of image builds (same version as rust-toolchain.toml);
+# with the file in the context, rustup in the image would install the toolchain again.
+/rust-toolchain.toml
+/.gitleaks.toml
+/LICENSE
+/*.md

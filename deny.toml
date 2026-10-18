@@ -1,0 +1,45 @@
+# cargo-deny configuration (https://embarkstudios.github.io/cargo-deny/), run in CI by the
+# `deny` job and locally with `cargo deny check`.
+
+[advisories]
+# RustSec advisory database: vulnerabilities always fail; unmaintained/unsound/yanked crates
+# fail as well so they are noticed and either replaced or explicitly ignored here (with reason).
+unmaintained = "all"
+yanked = "deny"
+ignore = [
+    # quick-xml 0.39 (only used by object_store 0.13 to parse the XML answers of the configured
+    # S3/GCS/Azure endpoint, i.e. not attacker-controlled input). Fixed in quick-xml 0.41, which
+    # needs object_store 0.14 (reqwest 0.13); remove both entries with that upgrade.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.39 via object_store 0.13; parses object store endpoint responses only" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.39 via object_store 0.13; parses object store endpoint responses only" },
+    # Marvin attack (no fixed release): timing side channel of RSA private-key operations. rsa is
+    # only used by jsonwebtoken to verify OIDC ID token signatures with public keys.
+    { id = "RUSTSEC-2023-0071", reason = "rsa via jsonwebtoken; public-key signature verification only" },
+]
+
+[licenses]
+# Permissive licenses compatible with distributing fast-turbo-cache-server under MIT.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    # webpki-roots (Mozilla CA bundle data)
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
+unused-allowed-license = "allow"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

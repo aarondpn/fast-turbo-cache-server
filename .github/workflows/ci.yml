@@ -1,0 +1,408 @@
+name: CI & Docker Image
+
+on:
+  push:
+    branches: ["master"]
+    tags: ["v*"]
+  pull_request:
+
+# Superseded PR runs are cancelled; pushes to branches/tags always run to completion so a
+# publish is never interrupted half-way (per-arch digests pushed but no manifest).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Least privilege by default; only the publish jobs (never run for pull requests) get
+# `packages: write`.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  # BuildKit of the buildx builders and the SBOM generator of the published images.
+  BUILDKIT_IMAGE: moby/buildkit:v0.34.0@sha256:b059f8d7226d0b326bc871af489a5dddf65e36af4d20d14251b072974d9ee87c
+  SBOM_SCANNER_IMAGE: docker/buildkit-syft-scanner:1.12.0@sha256:ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9
+
+# Action pins: every `uses:` is pinned to the full commit SHA of the release named in the
+# trailing comment (verified with `gh api repos/<owner>/<repo>/commits/<tag>`); automated
+# dependency updates keep them current. The Rust toolchain (version from rust-toolchain.toml) is
+# installed with the runner's preinstalled rustup instead of a third-party action. BuildKit and
+# the SBOM scanner of the image builds are pinned by digest as well.
+#
+# Caches: the Rust caches only speed up the test jobs (hence the `cache-poisoning` ignores for
+# zizmor); the published image is always built from scratch, without any cache.
+
+jobs:
+  test:
+    name: Clippy & Tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 # zizmor: ignore[cache-poisoning]
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Unit, integration & stress tests
+        run: cargo test --locked
+      - name: cargo fmt --check
+        # Last, and also after a failed step, so it reports independently of clippy and tests.
+        if: ${{ !cancelled() }}
+        run: cargo fmt --all -- --check
+
+  msrv:
+    name: MSRV (rust-version from Cargo.toml)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install MSRV toolchain
+        run: |
+          msrv="$(sed -n 's/^rust-version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)"
+          test -n "$msrv" || { echo "rust-version missing in Cargo.toml" >&2; exit 1; }
+          echo "MSRV=$msrv" >> "$GITHUB_ENV"
+          # Overrides rust-toolchain.toml for the following steps (also rust-cache's key).
+          echo "RUSTUP_TOOLCHAIN=$msrv" >> "$GITHUB_ENV"
+          rustup toolchain install "$msrv" --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 # zizmor: ignore[cache-poisoning]
+        with:
+          key: msrv
+      - name: cargo check on MSRV
+        # Warnings are errors here too: lints change between compiler releases, so code that
+        # is warning-free on stable can still warn on the MSRV.
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo +"$MSRV" check --locked --all-targets
+
+  deny:
+    name: cargo-deny (advisories, licenses, bans, sources)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --locked
+
+  zizmor:
+    name: zizmor (workflow security)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@85b2b9fb8e3325e7a23d7d0a9d7ba5ae0f999e3e # v0.7.1
+        with:
+          version: 1.31.1
+          # Findings fail the job and are printed in the log (no code scanning upload).
+          advanced-security: false
+
+  compose:
+    name: docker compose config (default + profiles)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate compose file
+        run: |
+          docker compose config -q
+          docker compose --profile rustfs config -q
+          docker compose --profile garage config -q
+          docker compose --profile rustfs --profile garage config -q
+          # The s3-live override (published RustFS port, healthcheck start_interval).
+          COMPOSE_FILE=docker-compose.yml:.github/compose-live.yml docker compose --profile rustfs config -q
+
+  s3-live:
+    # Real SigV4 / S3 semantics against an S3-compatible server (tests/it/s3.rs, gated on
+    # TURBO_S3_LIVE_TEST=1). RustFS is provisioned by the `rustfs` compose profile (image pin,
+    # healthcheck, bucket creation); .github/compose-live.yml publishes its port on loopback and
+    # shortens the healthcheck start interval.
+    name: S3 live test (rustfs)
+    runs-on: ubuntu-24.04
+    env:
+      COMPOSE_FILE: docker-compose.yml:.github/compose-live.yml
+      COMPOSE_PROFILES: rustfs
+      TURBO_S3_LIVE_TEST: "1"
+      TURBO_S3_ENDPOINT: http://127.0.0.1:9000
+      TURBO_S3_ACCESS_KEY: ci-access-key
+      TURBO_S3_SECRET_KEY: ci-secret-key-0123456789
+      TURBO_S3_BUCKET: turbo-cache-ci
+      TURBO_S3_REGION: us-east-1
+      # Deliberately explicit: the test asserts that the store honours `If-None-Match: *`
+      # (IMMUTABLE_ARTIFACTS relies on it). If an image update fails only here, the new store
+      # version stopped honouring conditional writes; do not just flip this to "false", treat it
+      # as a regression of that store (docs/storage.md, "Write-once on object stores").
+      TURBO_S3_CONDITIONAL: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Start RustFS and create the bucket (compose profile rustfs)
+        # Starts s3-credentials-check and rustfs, waits for its healthcheck, then runs rustfs-init.
+        env:
+          S3_ACCESS_KEY_ID: ${{ env.TURBO_S3_ACCESS_KEY }}
+          S3_SECRET_ACCESS_KEY: ${{ env.TURBO_S3_SECRET_KEY }}
+          S3_BUCKET: ${{ env.TURBO_S3_BUCKET }}
+          S3_REGION: ${{ env.TURBO_S3_REGION }}
+        run: docker compose run --rm rustfs-init
+      - name: Install Rust (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 # zizmor: ignore[cache-poisoning]
+      - name: cargo test --test it s3::live_s3_roundtrip (live)
+        # Runs exactly the live test (the mock-based s3 tests run in the `test` job). The test
+        # passes silently when TURBO_S3_LIVE_TEST is not picked up, so the step also checks that
+        # it really talked to the store.
+        run: |
+          set -o pipefail
+          cargo test --locked --test it s3::live_s3_roundtrip -- --exact --nocapture 2>&1 | tee live-test.log
+          grep -q "live S3 test against $TURBO_S3_ENDPOINT bucket $TURBO_S3_BUCKET" live-test.log
+      - name: Store logs on failure
+        if: failure()
+        run: docker compose logs || true
+
+  azure-live:
+    # Azure Blob Storage semantics (block uploads, `If-None-Match: *`, `x-ms-meta-*` names, error
+    # codes) against Azurite (tests/it/cloud.rs, gated on TURBO_AZURE_LIVE_TEST=1).
+    name: Azure live test (azurite)
+    runs-on: ubuntu-24.04
+    env:
+      TURBO_AZURE_LIVE_TEST: "1"
+      TURBO_AZURE_ENDPOINT: http://127.0.0.1:10000/devstoreaccount1
+      TURBO_AZURE_CONTAINER: turbo-cache-ci
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Start Azurite and create the container
+        # `az` is preinstalled on the runner; the key is Azurite's well-known development key.
+        run: |
+          docker run -d --name azurite -p 127.0.0.1:10000:10000 \
+            mcr.microsoft.com/azure-storage/azurite:3.37.0@sha256:830430c1da1a2d537e08f3e6764dd1f5ae00cf0346bcaf625b968ec3f0971fd5 \
+            azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck
+          for _ in $(seq 1 30); do curl -s -o /dev/null http://127.0.0.1:10000/ && break; sleep 1; done
+          az storage container create -n "$TURBO_AZURE_CONTAINER" --connection-string \
+            "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=$TURBO_AZURE_ENDPOINT;"
+      - name: Install Rust (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 # zizmor: ignore[cache-poisoning]
+      - name: cargo test --test it cloud::live_azure_roundtrip (live)
+        run: |
+          set -o pipefail
+          cargo test --locked --test it cloud::live_azure_roundtrip -- --exact --nocapture 2>&1 | tee live-test.log
+          grep -q "live Azure test against $TURBO_AZURE_ENDPOINT container $TURBO_AZURE_CONTAINER" live-test.log
+      - name: Store logs on failure
+        if: failure()
+        run: docker logs azurite || true
+
+  gcs-live:
+    # The GCS backend against fake-gcs-server (tests/it/cloud.rs, gated on TURBO_GCS_LIVE_TEST=1).
+    # Upstream fake-gcs-server lacks the XML API the backend uses; the fork used by object_store's
+    # own CI has it, but ignores metadata and preconditions and has no multipart uploads, which
+    # the test skips with TURBO_GCS_EMULATOR.
+    name: GCS live test (fake-gcs-server)
+    runs-on: ubuntu-24.04
+    env:
+      TURBO_GCS_LIVE_TEST: "1"
+      TURBO_GCS_EMULATOR: http://127.0.0.1:4443
+      TURBO_GCS_BUCKET: turbo-cache-ci
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Start fake-gcs-server and create the bucket
+        run: |
+          docker run -d --name fake-gcs -p 127.0.0.1:4443:4443 \
+            tustvold/fake-gcs-server:latest@sha256:dcd3aeacc07c731f1336e90c2889be2af8626ae993ee1fe2c0ba042ebbeb5a04 \
+            -scheme http -backend memory -public-host 127.0.0.1:4443
+          for _ in $(seq 1 30); do curl -s -o /dev/null "$TURBO_GCS_EMULATOR/storage/v1/b" && break; sleep 1; done
+          curl -fsS -X POST -H "Content-Type: application/json" \
+            --data-binary "{\"name\":\"$TURBO_GCS_BUCKET\"}" "$TURBO_GCS_EMULATOR/storage/v1/b"
+      - name: Install Rust (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 # zizmor: ignore[cache-poisoning]
+      - name: cargo test --test it cloud::live_gcs_roundtrip (live)
+        run: |
+          set -o pipefail
+          cargo test --locked --test it cloud::live_gcs_roundtrip -- --exact --nocapture 2>&1 | tee live-test.log
+          grep -q "live GCS test against $TURBO_GCS_BUCKET" live-test.log
+      - name: Store logs on failure
+        if: failure()
+        run: docker logs fake-gcs || true
+
+  docker:
+    # Builds each architecture on a native runner (no QEMU) and smoke-tests the image:
+    # the HEALTHCHECK must turn healthy with a non-default PORT and an artifact round-trip
+    # must work. Runs for pull requests too, with a read-only token and without registry login.
+    name: Docker build & smoke test (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Prepare
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+      - name: Build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          push: false
+          tags: fast-turbo-cache-server:ci
+          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
+      - name: Smoke test (PORT=3001, healthcheck + artifact round-trip)
+        run: |
+          docker run -d --name smoke -p 127.0.0.1:13001:3001 \
+            -e PORT=3001 -e TURBO_TOKEN=ci-smoke-token-0123456789 fast-turbo-cache-server:ci
+          status=starting
+          for _ in $(seq 1 60); do
+            status="$(docker inspect -f '{{.State.Health.Status}}' smoke)"
+            [ "$status" = healthy ] && break
+            sleep 1
+          done
+          if [ "$status" != healthy ]; then docker logs smoke; exit 1; fi
+          auth='Authorization: Bearer ci-smoke-token-0123456789'
+          curl -fsS -X PUT -H "$auth" -H 'Content-Type: application/octet-stream' \
+            --data-binary 'smoke-artifact' 'http://127.0.0.1:13001/v8/artifacts/abcdef0123?teamId=ci'
+          test "$(curl -fsS -H "$auth" 'http://127.0.0.1:13001/v8/artifacts/abcdef0123?teamId=ci')" = smoke-artifact
+          docker rm -f -v smoke
+
+  docker-publish:
+    name: Publish image (${{ matrix.platform }})
+    if: github.event_name == 'push'
+    needs: [test, msrv, deny, zizmor, compose, docker]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write # push the per-architecture images to GHCR
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Prepare
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+          echo "IMAGE_REF=${REGISTRY}/${IMAGE_NAME,,}" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Extract Docker metadata (labels)
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE_REF }}
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE_REF }},push-by-digest=true,name-canonical=true,push=true
+          # No cache: a poisoned cache entry cannot end up in a published image.
+          no-cache: true
+          # SLSA provenance and an SBOM, attached to the image as attestations.
+          provenance: mode=max
+          sbom: generator=${{ env.SBOM_SCANNER_IMAGE }}
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  docker-manifest:
+    name: Publish multi-arch manifest
+    if: github.event_name == 'push'
+    needs: docker-publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write # push the multi-arch manifest list and its tags to GHCR
+    steps:
+      - name: Prepare
+        run: echo "IMAGE_REF=${REGISTRY}/${IMAGE_NAME,,}" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract Docker metadata (tags)
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE_REF }}
+          # `latest` only for the repository's default branch (see docs/deployment.md).
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          META_JSON: ${{ steps.meta.outputs.json }}
+        run: |
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$META_JSON") \
+            $(printf "${IMAGE_REF}@sha256:%s " *)
+      - name: Inspect image
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: docker buildx imagetools inspect "${IMAGE_REF}:${VERSION}"

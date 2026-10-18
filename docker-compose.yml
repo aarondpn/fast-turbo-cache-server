@@ -1,0 +1,331 @@
+# fast-turbo-cache-server with Docker Compose.
+#
+#   cp .env.example .env              # set TURBO_TOKEN and review the settings
+#   docker compose up -d --build      # local filesystem backend (default, no profile)
+#
+# Bundled S3-compatible stores (optional profiles; set STORAGE_TYPE and the store credentials in
+# .env, see .env.example):
+#   docker compose --profile rustfs up -d --build   # STORAGE_TYPE=rustfs
+#   docker compose --profile garage up -d --build   # STORAGE_TYPE=garage (+ GARAGE_RPC_SECRET, GARAGE_ADMIN_TOKEN)
+# The stores are only reachable on the internal compose network (no published ports). For these
+# two STORAGE_TYPEs compose/<STORAGE_TYPE>.env sets S3_ENDPOINT to the bundled store
+# (http://rustfs:9000, http://garage:3900); the server's own default
+# (127.0.0.1) would point at the turbo-cache container itself. Set S3_ENDPOINT in .env to use an
+# external store instead (then start without the profile).
+#
+# Images: `docker compose build` tags the local build as `fast-turbo-cache-server:local` (never the
+# registry name). To run the published image instead:
+#   TURBO_CACHE_IMAGE=ghcr.io/aarondpn/fast-turbo-cache-server:latest docker compose up -d --no-build --pull always
+#
+# Every variable in `.env` is passed to the server (env_file), so all options from
+# docs/configuration.md can be set there. The values under `environment:` describe the
+# container layout and always win over `.env`.
+
+name: fast-turbo-cache-server
+
+x-hardening: &hardening
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
+x-curl: &curl
+  # One-shot shell jobs (config checks, bucket/store init) in the hardened curl image.
+  image: curlimages/curl:8.23.0@sha256:a134550be58ab783810e613ae96fd253c38f7bdd16d9bf9be350700c7a29ac06
+  <<: *hardening
+  read_only: true
+  restart: "no"
+  entrypoint: ["/bin/sh", "-c"]
+
+x-bucket-init: &bucket-init
+  # Creates the bucket (idempotent) once the store is healthy, using curl's built-in SigV4 signer.
+  <<: *curl
+  command:
+    - |
+      set -eu
+      url="$${S3_INIT_ENDPOINT}/$${S3_BUCKET}"
+      for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        code=$$(curl -sS -o /dev/null -w '%{http_code}' --aws-sigv4 "aws:amz:$${S3_REGION}:s3" \
+          --user "$${S3_ACCESS_KEY_ID}:$${S3_SECRET_ACCESS_KEY}" -X PUT "$$url" || echo 000)
+        case "$$code" in
+          200|409) echo "bucket $${S3_BUCKET} ready (HTTP $$code)"; exit 0 ;;
+        esac
+        echo "bucket creation attempt $$attempt failed (HTTP $$code), retrying"
+        sleep 2
+      done
+      exit 1
+  environment: &bucket-init-env
+    # Keep in sync with the turbo-cache service below.
+    S3_BUCKET: ${S3_BUCKET:-${AWS_BUCKET:-turbo-cache}}
+    S3_REGION: ${S3_REGION:-us-east-1}
+    S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+    S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+
+services:
+  turbo-cache:
+    image: ${TURBO_CACHE_IMAGE:-fast-turbo-cache-server:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    <<: *hardening
+    read_only: true
+    env_file:
+      # Per-backend compose defaults first (only S3_ENDPOINT of the bundled store; the file exists
+      # for rustfs and garage only), then .env, which overrides them.
+      - path: compose/${STORAGE_TYPE:-local}.env
+        required: false
+      - path: .env
+        required: false
+    environment:
+      # Container layout (overrides .env): listen on 3000 inside the container, keep artifacts and
+      # upload spool files on the data volume (the root filesystem is read-only, and spooling to a
+      # tmpfs would count against the memory limit).
+      HOST: "0.0.0.0"
+      PORT: "3000"
+      LOCAL_STORAGE_PATH: /data/turbo-cache
+      SPOOL_DIR: /data/turbo-cache/.spool
+      # Same value that selected compose/<STORAGE_TYPE>.env above (from the shell or .env).
+      STORAGE_TYPE: ${STORAGE_TYPE:-local}
+      # Also forwarded from the shell (`TURBO_TOKEN=... docker compose up`). Leave it empty when
+      # using TURBO_TOKEN_FILE or only TURBO_SCOPED_TOKENS; the server refuses to start without
+      # any token unless ALLOW_UNAUTHENTICATED=true.
+      TURBO_TOKEN: ${TURBO_TOKEN:-}
+      # Same bucket the rustfs-init/garage-init containers create. The server itself
+      # has no default bucket (S3 backends fail to start without one); compose supplies
+      # `turbo-cache`, so the bundled profiles work with only STORAGE_TYPE and the keys set.
+      # Ignored by the local backend.
+      S3_BUCKET: ${S3_BUCKET:-${AWS_BUCKET:-turbo-cache}}
+      # Forwarded from the shell (or .env) like for the bucket-init containers, so
+      # `S3_ACCESS_KEY_ID=... S3_SECRET_ACCESS_KEY=... docker compose --profile rustfs up` gives
+      # the store and the server the same keys. Empty = unset: the server then uses
+      # S3_SECRET_ACCESS_KEY_FILE or the AWS credential chain, and its own region default.
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+      S3_REGION: ${S3_REGION:-}
+    ports:
+      # Loopback only by default: the server speaks plain HTTP, so expose it through a TLS
+      # terminating reverse proxy (docs/deployment.md, "Reverse proxy and TLS"). Set
+      # BIND_ADDRESS=0.0.0.0 only behind one.
+      - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-3000}:3000"
+    volumes:
+      - turbo-cache-data:/data/turbo-cache
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    # Budget: hot cache (MEMORY_CACHE_MAX_BYTES, 128 MiB) + in-RAM uploads
+    # (MAX_CONCURRENT_UPLOADS x UPLOAD_MEMORY_THRESHOLD = 32 x 4 MiB; with an object store
+    # MAX_CONCURRENT_UPLOADS x (STORAGE_PARTS_IN_FLIGHT + 1) parts of 8 MiB = 32 x 40 MiB worst
+    # case, only when every upload slot holds a large upload the store is slow to accept)
+    # + connection buffers (bounded by the reverse proxy's connection limit, see
+    # docs/deployment.md, "Memory") + runtime.
+    # Raise it together with those settings.
+    mem_limit: ${TURBO_CACHE_MEM_LIMIT:-1g}
+    pids_limit: 512
+    # SHUTDOWN_GRACE_SECS (30) plus a margin, so in-flight uploads can finish on `docker stop`.
+    stop_grace_period: 40s
+    # Health: the image's HEALTHCHECK (`fast-turbo-cache-server healthcheck`, honours PORT).
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+        required: false
+      garage-init:
+        condition: service_completed_successfully
+        required: false
+
+  # --- profile: rustfs (credentials check) ------------------------------------------------
+  s3-credentials-check:
+    # Runs once before the bundled store. With missing credentials it fails `docker compose up`
+    # with a clear message and the store is never started: no fallback to default root
+    # credentials, and no restart loop (the stores keep `restart: unless-stopped` so they come
+    # back after a daemon restart, which `on-failure` would not do reliably).
+    <<: *curl
+    profiles: [rustfs]
+    network_mode: none
+    command:
+      - |
+        if [ -z "$${S3_ACCESS_KEY_ID}" ] || [ "$${#S3_SECRET_ACCESS_KEY}" -lt 8 ]; then
+          echo 'Set S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY (>= 8 characters) in .env' >&2
+          exit 1
+        fi
+        echo 'store credentials set'
+    environment:
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+
+  # --- profile: rustfs --------------------------------------------------------------------
+  rustfs:
+    image: rustfs/rustfs:1.0.2@sha256:7e948dad4748bda48f8985fda7195f8cf2e4259427011f6120acc2c9acf51587
+    profiles: [rustfs]
+    restart: unless-stopped
+    <<: *hardening
+    depends_on:
+      s3-credentials-check:
+        condition: service_completed_successfully
+    environment:
+      # RustFS itself also refuses to start with empty credentials.
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY_ID:-}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_ACCESS_KEY:-}
+      RUSTFS_VOLUMES: /data
+    volumes:
+      - rustfs-data:/data
+    mem_limit: ${RUSTFS_MEM_LIMIT:-1g}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  rustfs-init:
+    <<: *bucket-init
+    profiles: [rustfs]
+    environment:
+      <<: *bucket-init-env
+      S3_INIT_ENDPOINT: http://rustfs:9000
+    depends_on:
+      rustfs:
+        condition: service_healthy
+
+  # --- profile: garage --------------------------------------------------------------------
+  garage-config-check:
+    # Like s3-credentials-check, for the settings Garage needs: the S3 key pair that garage-init
+    # imports, the cluster RPC secret and the admin API token. Garage itself refuses to start
+    # without an RPC secret.
+    <<: *curl
+    profiles: [garage]
+    network_mode: none
+    command:
+      - |
+        fail=0
+        if ! printf '%s' "$${S3_ACCESS_KEY_ID}" | grep -Eqx '[A-Za-z0-9._-]{8,128}'; then
+          echo 'Set S3_ACCESS_KEY_ID in .env: 8-128 characters [A-Za-z0-9._-] (Garage key ID)' >&2; fail=1
+        fi
+        # garage-init sends the secret inside a JSON document.
+        if ! printf '%s' "$${S3_SECRET_ACCESS_KEY}" | grep -Eqx '[^"\\[:space:]]{8,}'; then
+          echo 'Set S3_SECRET_ACCESS_KEY in .env: >= 8 characters, no quotes, backslashes or spaces' >&2; fail=1
+        fi
+        if ! printf '%s' "$${GARAGE_RPC_SECRET}" | grep -Eqx '[0-9a-fA-F]{64}'; then
+          echo 'Set GARAGE_RPC_SECRET in .env: 64 hex characters (openssl rand -hex 32)' >&2; fail=1
+        fi
+        if [ "$${#GARAGE_ADMIN_TOKEN}" -lt 16 ]; then
+          echo 'Set GARAGE_ADMIN_TOKEN in .env: >= 16 characters (openssl rand -hex 32)' >&2; fail=1
+        fi
+        [ "$$fail" = 0 ] && echo 'garage settings set'
+        exit "$$fail"
+    environment:
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET:-}
+      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:-}
+
+  garage:
+    image: dxflrs/garage:v2.4.1@sha256:9c96caa2612d3411acc5b0e6701fb238dbfba33e533a6d7d3d811a4b12d0d020
+    profiles: [garage]
+    restart: unless-stopped
+    <<: *hardening
+    read_only: true
+    depends_on:
+      garage-config-check:
+        condition: service_completed_successfully
+    environment:
+      # Read by Garage instead of the rpc_secret/admin_token keys of garage.toml.
+      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET:-}
+      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:-}
+    volumes:
+      - ./compose/garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+    mem_limit: ${GARAGE_MEM_LIMIT:-1g}
+    healthcheck:
+      # The image only contains the garage binary; `garage status` asks the node over RPC.
+      test: ["CMD", "/garage", "status"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  garage-init:
+    # Idempotent single-node setup through the admin API (the garage image has no shell):
+    # assign the node a layout role (first start only), import the S3 key pair from .env, create
+    # the bucket and grant the key read/write access to it.
+    <<: *curl
+    profiles: [garage]
+    depends_on:
+      garage:
+        condition: service_healthy
+    command:
+      - |
+        set -eu
+        api=http://garage:3903/v2
+        # call PATH [JSON]: sets $$code and $$body (whitespace removed, Garage pretty-prints JSON).
+        call() {
+          if [ $$# -ge 2 ]; then
+            out=$$(curl -sS -w '\n%{http_code}' -H "Authorization: Bearer $${GARAGE_ADMIN_TOKEN}" \
+              -H 'Content-Type: application/json' -X POST --data "$$2" "$$api/$$1") || out='000'
+          else
+            out=$$(curl -sS -w '\n%{http_code}' -H "Authorization: Bearer $${GARAGE_ADMIN_TOKEN}" \
+              "$$api/$$1") || out='000'
+          fi
+          code=$$(printf '%s\n' "$$out" | tail -n 1)
+          body=$$(printf '%s\n' "$$out" | sed '$$d' | tr -d ' \n')
+        }
+        expect() {
+          case " $$1 " in *" $$code "*) ;; *) echo "$$2 failed (HTTP $$code): $$body" >&2; exit 1 ;; esac
+        }
+        for attempt in $$(seq 1 30); do
+          call GetClusterStatus
+          [ "$$code" = 200 ] && break
+          echo "admin API not ready (HTTP $$code), retrying"; sleep 2
+        done
+        expect 200 GetClusterStatus
+        node=$$(printf '%s' "$$body" | grep -o '"id":"[0-9a-f]\{64\}"' | head -n 1 | cut -d '"' -f 4)
+        [ -n "$$node" ] || { echo "no node ID in cluster status: $$body" >&2; exit 1; }
+
+        call GetClusterLayout
+        expect 200 GetClusterLayout
+        if printf '%s' "$$body" | grep -q '"roles":\[\]'; then
+          version=$$(printf '%s' "$$body" | grep -o '"version":[0-9]*' | head -n 1 | cut -d : -f 2)
+          # Capacity only weights data placement between nodes; it is not a quota.
+          call UpdateClusterLayout "{\"roles\":[{\"id\":\"$$node\",\"zone\":\"dc1\",\"capacity\":1000000000000,\"tags\":[]}]}"
+          expect 200 UpdateClusterLayout
+          call ApplyClusterLayout "{\"version\":$$((version + 1))}"
+          expect 200 ApplyClusterLayout
+          echo "layout applied (node $$node)"
+        else
+          echo 'layout already configured'
+        fi
+
+        call "GetKeyInfo?id=$${S3_ACCESS_KEY_ID}&showSecretKey=true"
+        if [ "$$code" = 404 ] || { [ "$$code" = 400 ] && printf '%s' "$$body" | grep -q 'NoSuchAccessKey'; }; then
+          call ImportKey "{\"accessKeyId\":\"$${S3_ACCESS_KEY_ID}\",\"secretAccessKey\":\"$${S3_SECRET_ACCESS_KEY}\",\"name\":\"turbo-cache\"}"
+          expect 200 ImportKey
+          echo "key $${S3_ACCESS_KEY_ID} imported"
+        else
+          expect 200 GetKeyInfo
+          printf '%s' "$$body" | grep -qF "\"secretAccessKey\":\"$${S3_SECRET_ACCESS_KEY}\"" || {
+            echo "key $${S3_ACCESS_KEY_ID} already exists in Garage with a different secret; restore the old S3_SECRET_ACCESS_KEY or remove the garage-meta volume" >&2
+            exit 1
+          }
+          echo "key $${S3_ACCESS_KEY_ID} already present"
+        fi
+
+        call "GetBucketInfo?globalAlias=$${S3_BUCKET}"
+        if [ "$$code" != 200 ]; then
+          call CreateBucket "{\"globalAlias\":\"$${S3_BUCKET}\"}"
+          expect 200 CreateBucket
+          echo "bucket $${S3_BUCKET} created"
+        fi
+        bucket=$$(printf '%s' "$$body" | grep -o '"id":"[0-9a-f]\{64\}"' | head -n 1 | cut -d '"' -f 4)
+        [ -n "$$bucket" ] || { echo "no bucket ID: $$body" >&2; exit 1; }
+        call AllowBucketKey "{\"bucketId\":\"$$bucket\",\"accessKeyId\":\"$${S3_ACCESS_KEY_ID}\",\"permissions\":{\"read\":true,\"write\":true,\"owner\":false}}"
+        expect 200 AllowBucketKey
+        echo "bucket $${S3_BUCKET} ready for key $${S3_ACCESS_KEY_ID}"
+    environment:
+      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:-}
+      S3_BUCKET: ${S3_BUCKET:-${AWS_BUCKET:-turbo-cache}}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+
+volumes:
+  turbo-cache-data:
+  rustfs-data:
+  garage-meta:
+  garage-data:

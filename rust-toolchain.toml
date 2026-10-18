@@ -1,0 +1,7 @@
+# Toolchain for development and CI, pinned so that a new Rust release (new lints, deprecations)
+# arrives as a dependency update instead of breaking CI. The MSRV (`rust-version` in Cargo.toml)
+# is checked separately; the Docker image builds with the `rust` base image of the same version.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
