@@ -1,0 +1,22 @@
+# Single-node Garage for the `garage` profile of docker-compose.yml.
+# rpc_secret and admin_token are not stored here: Garage reads them from the GARAGE_RPC_SECRET and
+# GARAGE_ADMIN_TOKEN environment variables (set in .env). The cluster layout, the access key and
+# the bucket are created by the `garage-init` service through the admin API.
+metadata_dir = "/var/lib/garage/meta"
+data_dir = "/var/lib/garage/data"
+db_engine = "sqlite"
+
+# One node, one copy of every object (no redundancy; use a real multi-node cluster for that).
+replication_factor = 1
+
+rpc_bind_addr = "[::]:3901"
+rpc_public_addr = "127.0.0.1:3901"
+
+[s3_api]
+# Matches the server's default region for STORAGE_TYPE=garage.
+s3_region = "garage"
+api_bind_addr = "[::]:3900"
+
+[admin]
+# Used by garage-init (layout, key and bucket setup); not published outside the compose network.
+api_bind_addr = "[::]:3903"

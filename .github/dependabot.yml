@@ -1,0 +1,31 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # Dockerfile base images (pinned by digest).
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+
+  # Images referenced by docker-compose.yml (RustFS, Garage, curl init jobs); the CI s3-live
+  # job uses the same file, so these pins exist only there.
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly

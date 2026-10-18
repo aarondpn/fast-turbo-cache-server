@@ -1,0 +1,10 @@
+# CI `s3-live` job only (COMPOSE_FILE=docker-compose.yml:.github/compose-live.yml): publish the
+# bundled RustFS S3 API on loopback so the live test on the host can reach it, and probe its
+# health every second during the start period instead of every 5 s (needs Docker Engine >= 25).
+# Locally (README "Development"), use a separate project name so `down -v` cannot touch the
+# volumes of a real `fast-turbo-cache-server` deployment.
+services:
+  rustfs:
+    ports: ["127.0.0.1:${S3_LIVE_PORT:-9000}:9000"]
+    healthcheck:
+      start_interval: 1s
