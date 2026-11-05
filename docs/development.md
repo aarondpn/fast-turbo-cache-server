@@ -2,6 +2,8 @@
 
 Minimum supported Rust version: 1.88. Development and CI use the toolchain pinned in `rust-toolchain.toml`; `rustup toolchain install` installs it.
 
+Source builds also require a C compiler and CMake for the AWS-LC crypto backend used to verify OIDC tokens. On Debian/Ubuntu, install `build-essential` and `cmake`; on macOS, install the Xcode command line tools and CMake.
+
 ## Checks
 
 ```bash

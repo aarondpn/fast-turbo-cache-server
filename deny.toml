@@ -12,9 +12,6 @@ ignore = [
     # needs object_store 0.14 (reqwest 0.13); remove both entries with that upgrade.
     { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.39 via object_store 0.13; parses object store endpoint responses only" },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.39 via object_store 0.13; parses object store endpoint responses only" },
-    # Marvin attack (no fixed release): timing side channel of RSA private-key operations. rsa is
-    # only used by jsonwebtoken to verify OIDC ID token signatures with public keys.
-    { id = "RUSTSEC-2023-0071", reason = "rsa via jsonwebtoken; public-key signature verification only" },
 ]
 
 [licenses]

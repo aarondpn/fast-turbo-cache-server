@@ -1,6 +1,6 @@
 [package]
 name = "fast-turbo-cache-server"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Self-hosted Turborepo remote cache server in Rust for RustFS, Garage, S3, Google Cloud Storage, Azure Blob Storage and local storage"
 license = "MIT"
@@ -40,8 +40,9 @@ fastrand = "2.3"
 hmac = "0.13"
 http = "1.1"
 http-body-util = "0.1"
-# OIDC ID token verification (`oidc`); RustCrypto backend (pure Rust, no C toolchain).
-jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
+# OIDC ID token verification (`oidc`); AWS-LC avoids the vulnerable RustCrypto
+# crypto-bigint dependency. Building from source requires a C compiler and CMake.
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
 lru = { version = "0.18.5", default-features = false }
 # Maps large spooled immutable uploads for the single conditional S3 `PUT` (no copy into RAM).
 memmap2 = "0.9"
@@ -68,7 +69,7 @@ url = "2.5"
 [dev-dependencies]
 hex = "0.4"
 # PEM test keys for signing ID tokens in the `oidc` integration tests.
-jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto", "use_pem"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 # Paused clock (`tokio::time::advance`) in timer tests.
 tokio = { version = "1.40", features = ["test-util"] }
 # `Response::json` in the HTTP tests.
