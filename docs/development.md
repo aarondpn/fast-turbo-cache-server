@@ -2,6 +2,8 @@
 
 Minimum supported Rust version: 1.88. Development and CI use the toolchain pinned in `rust-toolchain.toml`; `rustup toolchain install` installs it.
 
+Source builds also require a C compiler and CMake for the AWS-LC crypto backend used to verify OIDC tokens. On Debian/Ubuntu, install `build-essential` and `cmake`; on macOS, install the Xcode command line tools and CMake.
+
 ## Checks
 
 ```bash
@@ -25,7 +27,7 @@ CI runs [zizmor](https://docs.zizmor.sh/) on the GitHub Actions workflows for ev
 | `feat!: change the token format` or a `BREAKING CHANGE:` footer | Minor before 1.0; major from 1.0 (`1.2.3` → `2.0.0`) |
 | `docs:`, `chore:`, `ci:`, `test:`, `refactor:` | No release by themselves |
 
-After all CI checks pass on `master`, the workflow opens or updates a release PR with the next version in `Cargo.toml`, `Cargo.lock` and `.release-please-manifest.json`, plus generated `CHANGELOG.md` entries. The baseline is the existing `0.1.0`; the first release PR includes the repository's existing commit history. Review and merge that PR to publish its `vMAJOR.MINOR.PATCH` tag and GitHub Release with release notes. The project is distributed through GHCR; nothing is published to crates.io.
+After all CI checks pass on `master`, the workflow opens or updates a release PR with the next version in `Cargo.toml`, `Cargo.lock` and `.release-please-manifest.json`, plus generated `CHANGELOG.md` entries. The baseline is the existing `0.1.1`; the first release PR includes the repository's existing commit history. Review and merge that PR to publish its `vMAJOR.MINOR.PATCH` tag and GitHub Release with release notes. The project is distributed through GHCR; nothing is published to crates.io.
 
 The same workflow publishes the multi-architecture image with the full version (`1.2.3`), minor (`1.2`) and, from 1.0 onward, major (`1`) tags. It also keeps the existing `master`, `latest` and `sha-<commit>` tags. Version tags must match the Cargo and release manifest versions; CI rejects malformed or mismatched tags. If Docker publishing fails after a release is created, use **Re-run failed jobs** so the successful release job's tag output is retained.
 

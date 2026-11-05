@@ -11,6 +11,7 @@ ARG CARGO_CHEF_VERSION=0.1.78
 FROM rust:1.99.1-bookworm@sha256:e12566d5abc17a0da741628782cdb504b68b8961f5bfcf677936bf3e8b32de29 AS chef
 ARG CARGO_CHEF_VERSION
 WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends cmake && rm -rf /var/lib/apt/lists/*
 RUN cargo install --locked cargo-chef --version "${CARGO_CHEF_VERSION}"
 
 # Compute a dependency-only recipe from the manifests. The recipe only changes when
