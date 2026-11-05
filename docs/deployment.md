@@ -2,7 +2,7 @@
 
 ## Docker image
 
-`ghcr.io/aarondpn/fast-turbo-cache-server` is built for `linux/amd64` and `linux/arm64`: `latest` and the branch name from the default branch, `1.2.3` and `1.2` from version tags, and `sha-<commit>` for every published commit.
+`ghcr.io/aarondpn/fast-turbo-cache-server` is built for `linux/amd64` and `linux/arm64`: `latest` and the branch name from the default branch, `1.2.3`, `1.2` and (from 1.0 onward) `1` for SemVer releases, and `sha-<commit>` for every published commit. Pin the full version to deploy a specific release. See [versioning and releases](development.md#versioning-and-releases) for the GitHub Actions release process.
 
 - The image is distroless (no shell) and runs as UID 10001. The local backend stores artifacts in the volume `/data/turbo-cache`.
 - The `HEALTHCHECK` runs `fast-turbo-cache-server healthcheck`, which probes `/healthz` using `HOST` and `PORT` from the environment. Set those as environment variables, not flags.

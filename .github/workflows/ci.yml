@@ -1,4 +1,4 @@
-name: CI & Docker Image
+name: CI, Releases & Docker Image
 
 on:
   push:
@@ -12,8 +12,8 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# Least privilege by default; only the publish jobs (never run for pull requests) get
-# `packages: write`.
+# Least privilege by default; release and publish jobs get their own write permissions
+# and never run for pull requests.
 permissions:
   contents: read
 
@@ -36,6 +36,41 @@ env:
 # zizmor); the published image is always built from scratch, without any cache.
 
 jobs:
+  release-metadata:
+    name: Validate release versions
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check Cargo, release manifest and version tags agree
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          cargo = tomllib.loads(Path("Cargo.toml").read_text())["package"]
+          version = cargo["version"]
+          manifest = json.loads(Path(".release-please-manifest.json").read_text())
+          lock = tomllib.loads(Path("Cargo.lock").read_text())
+          package = next(p for p in lock["package"] if p["name"] == cargo["name"])
+          if manifest["."] != version or package["version"] != version:
+              raise SystemExit("Cargo.toml, Cargo.lock and release manifest versions must agree")
+          if os.environ["REF_TYPE"] == "tag":
+              tag = os.environ["REF_NAME"]
+              if not re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag):
+                  raise SystemExit("Release tags must use vMAJOR.MINOR.PATCH")
+              if tag != f"v{version}":
+                  raise SystemExit(f"Tag {tag} does not match Cargo version {version}")
+          print(f"Release metadata is consistent: {version}")
+          PY
+
   test:
     name: Clippy & Tests
     runs-on: ubuntu-24.04
@@ -290,10 +325,33 @@ jobs:
           test "$(curl -fsS -H "$auth" 'http://127.0.0.1:13001/v8/artifacts/abcdef0123?teamId=ci')" = smoke-artifact
           docker rm -f -v smoke
 
+  release:
+    name: Release PR & GitHub Release
+    if: github.event_name == 'push'
+    needs: [release-metadata, test, msrv, deny, zizmor, compose, s3-live, azure-live, gcs-live, docker]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write # release-please's release status labels
+    outputs:
+      tag-name: ${{ steps.release.outputs.tag_name }}
+      sha: ${{ steps.release.outputs.sha }}
+    steps:
+      - name: Update release PR or publish the merged release
+        if: github.ref == 'refs/heads/master'
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          target-branch: master
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
   docker-publish:
     name: Publish image (${{ matrix.platform }})
     if: github.event_name == 'push'
-    needs: [test, msrv, deny, zizmor, compose, docker]
+    needs: release
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -316,11 +374,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # A newer push may have landed while release-please was running. Build the
+          # exact released commit rather than assigning its version to another commit.
+          ref: ${{ needs.release.outputs.sha || github.sha }}
       - name: Extract Docker metadata (labels)
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.IMAGE_REF }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.release.outputs.tag-name || github.ref_name }}
+            org.opencontainers.image.revision=${{ needs.release.outputs.sha || github.sha }}
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           driver-opts: image=${{ env.BUILDKIT_IMAGE }}
@@ -359,14 +423,18 @@ jobs:
   docker-manifest:
     name: Publish multi-arch manifest
     if: github.event_name == 'push'
-    needs: docker-publish
+    needs: [release, docker-publish]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write # push the multi-arch manifest list and its tags to GHCR
     steps:
       - name: Prepare
-        run: echo "IMAGE_REF=${REGISTRY}/${IMAGE_NAME,,}" >> "$GITHUB_ENV"
+        env:
+          SOURCE_SHA: ${{ needs.release.outputs.sha || github.sha }}
+        run: |
+          echo "IMAGE_REF=${REGISTRY}/${IMAGE_NAME,,}" >> "$GITHUB_ENV"
+          echo "SOURCE_TAG=sha-${SOURCE_SHA:0:7}" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: ${{ runner.temp }}/digests
@@ -386,13 +454,19 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.IMAGE_REF }}
-          # `latest` only for the repository's default branch (see docs/deployment.md).
+          # Disable automatic latest from SemVer tags; the explicit branch rule below
+          # controls latest, including when a maintainer manually pushes a version tag.
+          flavor: latest=false
+          # Pass the release tag explicitly: tags made with GITHUB_TOKEN do not trigger
+          # a separate workflow. This run publishes the release image as well as master.
+          # `latest` only follows the default branch (see docs/deployment.md).
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha
+            type=semver,pattern={{version}},value=${{ needs.release.outputs.tag-name || github.ref_name }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release.outputs.tag-name || github.ref_name }}
+            type=semver,pattern={{major}},value=${{ needs.release.outputs.tag-name || github.ref_name }},enable=${{ !startsWith(needs.release.outputs.tag-name || github.ref_name, 'v0.') }}
+            type=raw,value=${{ env.SOURCE_TAG }},priority=100
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests
         env:
