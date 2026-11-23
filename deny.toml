@@ -12,6 +12,13 @@ ignore = [
     # needs object_store 0.14 (reqwest 0.13); remove both entries with that upgrade.
     { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.39 via object_store 0.13; parses object store endpoint responses only" },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.39 via object_store 0.13; parses object store endpoint responses only" },
+    # chrono and humantime were declared unmaintained (all versions, no patched release); neither
+    # advisory reports a vulnerability. object_store needs both (0.14 still does), and the server
+    # uses chrono directly for timestamps (web identity session name, object store janitor).
+    # Remove the entries once object_store has moved off them and the direct chrono use is
+    # replaced (jiff or time, as the advisory suggests).
+    { id = "RUSTSEC-2026-0543", reason = "chrono: unmaintained notice without a known vulnerability; required by object_store and used directly for timestamps" },
+    { id = "RUSTSEC-2026-0542", reason = "humantime: unmaintained notice (wraps chrono) without a known vulnerability; only pulled in by object_store" },
 ]
 
 [licenses]
